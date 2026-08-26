@@ -47,9 +47,10 @@
             android:layout_width="30dp"
             android:layout_height="40dp"
             android:gravity="center"
-            android:text="⠿"
+            android:text="≡"
             android:textColor="#FFFFFF"
-            android:textSize="18sp"
+            android:textStyle="bold"
+            android:textSize="20sp"
             android:contentDescription="Drag toolbar" />
 
         <!-- Tap to collapse/expand the rest of the buttons -->
@@ -58,9 +59,10 @@
             android:layout_width="30dp"
             android:layout_height="40dp"
             android:gravity="center"
-            android:text="◂"
+            android:text="&lt;"
             android:textColor="#FFFFFF"
-            android:textSize="16sp"
+            android:textStyle="bold"
+            android:textSize="18sp"
             android:contentDescription="Collapse toolbar" />
 
         <LinearLayout
@@ -125,6 +127,17 @@
                 android:textColor="#FFFFFF"
                 android:textSize="20sp"
                 android:contentDescription="Zoom in" />
+
+            <TextView
+                android:id="@+id/btnDragSelect"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:gravity="center"
+                android:text="SEL"
+                android:textColor="#FFFFFF"
+                android:textStyle="bold"
+                android:textSize="11sp"
+                android:contentDescription="Toggle drag-select mode" />
         </LinearLayout>
     </LinearLayout>
 
