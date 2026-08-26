@@ -8,7 +8,6 @@ import android.os.Handler
 import android.os.Looper
 import android.view.MotionEvent
 import android.view.View
-import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
@@ -21,6 +20,7 @@ import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.ImageView
+import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
@@ -30,16 +30,6 @@ import kotlin.math.hypot
 
 /**
  * A "desktop in your pocket" browser shell for Office Online (Excel, Word, etc).
- *
- * - Locked to landscape, immersive fullscreen.
- * - Loads pages with a desktop Chrome user-agent so Office serves the full
- *   desktop web app instead of the cut-down mobile layout.
- * - Provides a virtual mouse cursor: drag anywhere on the screen like a
- *   laptop trackpad to move the cursor, tap to left-click, long-press to
- *   right-click, double-tap to double-click, two-finger drag to scroll.
- *   Clicks are dispatched as real MouseEvents inside the page (not touch
- *   events), which is what lets hover menus / ribbons in Office behave
- *   like they do on a real desktop.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -47,14 +37,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cursor: ImageView
     private lateinit var touchPad: View
     private lateinit var rootContainer: FrameLayout
+    private lateinit var toolbar: View
+    private lateinit var toolbarButtons: View
 
-    // Current virtual cursor position, in screen pixels relative to rootContainer.
     private var cursorX = 0f
     private var cursorY = 0f
-
     private var mouseModeEnabled = true
 
-    // Gesture bookkeeping
+    // Trackpad gesture bookkeeping
     private var downTime = 0L
     private var startX = 0f
     private var startY = 0f
@@ -68,17 +58,21 @@ class MainActivity : AppCompatActivity() {
     private var lastFocusX = 0f
     private var lastFocusY = 0f
 
+    // Toolbar drag bookkeeping
+    private var toolbarDownRawX = 0f
+    private var toolbarDownRawY = 0f
+    private var toolbarStartTransX = 0f
+    private var toolbarStartTransY = 0f
+
+    // Page zoom (acts like a "resolution" control - shrinks/grows the whole desktop page)
+    private var pageZoomPercent = 70
+
     private val handler = Handler(Looper.getMainLooper())
     private var longPressRunnable: Runnable? = null
 
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
 
     companion object {
-        // Change this to any Office Online URL you like:
-        // Excel: https://excel.new
-        // Word:  https://word.new
-        // PowerPoint: https://powerpoint.new
-        // Office hub: https://www.office.com
         private const val START_URL = "https://excel.new"
 
         private const val DESKTOP_USER_AGENT =
@@ -89,12 +83,12 @@ class MainActivity : AppCompatActivity() {
         private const val TAP_TIME_THRESHOLD_MS = 250L
         private const val LONG_PRESS_MS = 480L
         private const val DOUBLE_TAP_MS = 300L
-
-        // >1 makes the cursor travel a bit faster than your finger, so you
-        // can reach the far side of a landscape screen without huge swipes.
         private const val CURSOR_SENSITIVITY = 1.35f
-
         private const val FILE_CHOOSER_REQUEST_CODE = 51426
+
+        private const val ZOOM_MIN = 30
+        private const val ZOOM_MAX = 150
+        private const val ZOOM_STEP = 5
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -108,10 +102,13 @@ class MainActivity : AppCompatActivity() {
         webView = findViewById(R.id.webView)
         cursor = findViewById(R.id.cursor)
         touchPad = findViewById(R.id.touchPad)
+        toolbar = findViewById(R.id.toolbar)
+        toolbarButtons = findViewById(R.id.toolbarButtons)
 
         setupWebView()
         setupTrackpad()
         setupToolbar()
+        setupToolbarDrag()
 
         webView.loadUrl(START_URL)
 
@@ -166,13 +163,13 @@ class MainActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
                 injectMouseHelperJs()
+                applyPageZoom()
             }
 
             override fun shouldOverrideUrlLoading(
                 view: WebView,
                 request: WebResourceRequest
             ): Boolean {
-                // Keep everything (including Microsoft login redirects) inside the WebView.
                 return false
             }
         }
@@ -222,34 +219,56 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Injects a small JS helper into the page that turns (x, y, type) requests
-     * from Kotlin into real MouseEvent / WheelEvent dispatches on the element
-     * under that point. Re-injected on every page load since navigation wipes
-     * the page's JS context.
+     * Injects a JS helper that finds the real element under a point - diving
+     * into open shadow roots, since Office's UI (Fluent UI web components)
+     * is built heavily on Shadow DOM - and fires BOTH PointerEvents and
+     * MouseEvents at it, which is what modern Office listens for.
      */
     private fun injectMouseHelperJs() {
         val js = """
             (function() {
-              window.__officeVM = function(type, x, y, extra) {
+              function deepElementFromPoint(x, y) {
                 var el = document.elementFromPoint(x, y);
+                var depth = 0;
+                while (el && el.shadowRoot && depth < 25) {
+                  var inner = el.shadowRoot.elementFromPoint(x, y);
+                  if (!inner || inner === el) break;
+                  el = inner;
+                  depth++;
+                }
+                return el;
+              }
+
+              window.__officeVM = function(type, x, y, extra) {
+                var el = deepElementFromPoint(x, y);
                 if (!el) return;
+                var btn = (extra && extra.button) || 0;
+
                 if (type === 'wheel') {
-                  var wheelEv = new WheelEvent('wheel', {
-                    view: window, bubbles: true, cancelable: true,
-                    clientX: x, clientY: y,
-                    deltaX: extra.dx, deltaY: extra.dy, deltaMode: 0
-                  });
-                  el.dispatchEvent(wheelEv);
+                  el.dispatchEvent(new WheelEvent('wheel', {
+                    view: window, bubbles: true, cancelable: true, composed: true,
+                    clientX: x, clientY: y, deltaX: extra.dx, deltaY: extra.dy, deltaMode: 0
+                  }));
                   return;
                 }
+
+                var buttonsVal = (type === 'mousedown' || type === 'pointerdown')
+                  ? (btn === 2 ? 2 : 1) : 0;
+
                 var opts = {
-                  view: window, bubbles: true, cancelable: true,
-                  clientX: x, clientY: y,
-                  button: extra && extra.button ? extra.button : 0,
-                  buttons: (type === 'mousedown') ? 1 : 0
+                  view: window, bubbles: true, cancelable: true, composed: true,
+                  clientX: x, clientY: y, button: btn, buttons: buttonsVal,
+                  pointerType: 'mouse', isPrimary: true, pointerId: 1
                 };
+
+                var pointerMap = { mousedown: 'pointerdown', mouseup: 'pointerup', mousemove: 'pointermove' };
+                if (pointerMap[type]) {
+                  try { el.dispatchEvent(new PointerEvent(pointerMap[type], opts)); } catch (e) {}
+                }
+
                 var ev = new MouseEvent(type, opts);
                 el.dispatchEvent(ev);
+
                 if (type === 'mousedown' && typeof el.focus === 'function') {
                   try { el.focus(); } catch (e) {}
                 }
@@ -275,6 +294,19 @@ class MainActivity : AppCompatActivity() {
         val density = resources.displayMetrics.density
         val scale = webView.scale.takeIf { it > 0f } ?: 1f
         return Pair(screenX / density / scale, screenY / density / scale)
+    }
+
+    /** Shrinks/grows the whole page like a resolution/zoom control, so more of a
+     *  desktop-sized UI (ribbon, panes, etc.) fits on a phone screen. */
+    private fun applyPageZoom() {
+        val js = "document.documentElement.style.zoom = '${pageZoomPercent}%';"
+        webView.evaluateJavascript(js, null)
+    }
+
+    private fun changeZoom(delta: Int) {
+        pageZoomPercent = (pageZoomPercent + delta).coerceIn(ZOOM_MIN, ZOOM_MAX)
+        applyPageZoom()
+        Toast.makeText(this, "Zoom: $pageZoomPercent%", Toast.LENGTH_SHORT).show()
     }
 
     // ---------------------------------------------------------------------
@@ -311,7 +343,6 @@ class MainActivity : AppCompatActivity() {
 
                 MotionEvent.ACTION_MOVE -> {
                     if (event.pointerCount >= 2) {
-                        // Two fingers: scroll the page instead of moving the cursor.
                         val fx = (event.getX(0) + event.getX(1)) / 2f
                         val fy = (event.getY(0) + event.getY(1)) / 2f
                         val dx = fx - lastFocusX
@@ -396,7 +427,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ---------------------------------------------------------------------
-    // Toolbar
+    // Toolbar: buttons, drag-to-move, collapse
     // ---------------------------------------------------------------------
 
     private fun setupToolbar() {
@@ -419,6 +450,38 @@ class MainActivity : AppCompatActivity() {
         findViewById<ImageButton>(R.id.btnKeyboard).setOnClickListener {
             val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
             imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0)
+        }
+        findViewById<TextView>(R.id.btnZoomOut).setOnClickListener { changeZoom(-ZOOM_STEP) }
+        findViewById<TextView>(R.id.btnZoomIn).setOnClickListener { changeZoom(ZOOM_STEP) }
+
+        findViewById<TextView>(R.id.btnCollapseToggle).setOnClickListener { view ->
+            val collapsed = toolbarButtons.visibility == View.VISIBLE
+            toolbarButtons.visibility = if (collapsed) View.GONE else View.VISIBLE
+            (view as TextView).text = if (collapsed) "▸" else "◂"
+        }
+    }
+
+    /** Lets you drag the whole floating toolbar anywhere on screen, so it never
+     *  permanently blocks part of the page underneath it. */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun setupToolbarDrag() {
+        val handleView = findViewById<TextView>(R.id.btnDragHandle)
+        handleView.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    toolbarDownRawX = event.rawX
+                    toolbarDownRawY = event.rawY
+                    toolbarStartTransX = toolbar.translationX
+                    toolbarStartTransY = toolbar.translationY
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.rawX - toolbarDownRawX
+                    val dy = event.rawY - toolbarDownRawY
+                    toolbar.translationX = toolbarStartTransX + dx
+                    toolbar.translationY = toolbarStartTransY + dy
+                }
+            }
+            true
         }
     }
 
