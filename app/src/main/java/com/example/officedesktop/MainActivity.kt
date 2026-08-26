@@ -51,6 +51,7 @@ class MainActivity : AppCompatActivity() {
     private var cursorX = 0f
     private var cursorY = 0f
     private var mouseModeEnabled = true
+    private var dragSelectModeEnabled = false
 
     // Trackpad gesture bookkeeping (moving the visual cursor)
     private var startX = 0f
@@ -259,6 +260,11 @@ class MainActivity : AppCompatActivity() {
         touchPad.setOnTouchListener { _, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    if (dragSelectModeEnabled) {
+                        cursorX = event.x.coerceIn(0f, rootContainer.width.toFloat())
+                        cursorY = event.y.coerceIn(0f, rootContainer.height.toFloat())
+                        updateCursorView()
+                    }
                     startX = event.x
                     startY = event.y
                     lastX = event.x
@@ -303,23 +309,34 @@ class MainActivity : AppCompatActivity() {
                             sendSynthetic(MotionEvent.ACTION_MOVE, scrollPointerX, scrollPointerY, scrollDownTime)
                         }
                     } else {
-                        val dx = (event.x - lastX) * CURSOR_SENSITIVITY
-                        val dy = (event.y - lastY) * CURSOR_SENSITIVITY
-                        lastX = event.x
-                        lastY = event.y
-
-                        val totalDist = hypot((event.x - startX).toDouble(), (event.y - startY).toDouble())
-                        if (totalDist > TAP_DISTANCE_THRESHOLD_PX) {
-                            isDragging = true
+                        if (dragSelectModeEnabled) {
+                            // Absolute mode: the mouse follows your finger exactly,
+                            // and stays "held down" the whole time -> real drag-select.
+                            cursorX = event.x.coerceIn(0f, rootContainer.width.toFloat())
+                            cursorY = event.y.coerceIn(0f, rootContainer.height.toFloat())
+                            updateCursorView()
                             if (syntheticTouchActive) {
-                                sendSynthetic(MotionEvent.ACTION_CANCEL, cursorX, cursorY, syntheticDownTime)
-                                syntheticTouchActive = false
+                                sendSynthetic(MotionEvent.ACTION_MOVE, cursorX, cursorY, syntheticDownTime)
                             }
-                        }
+                        } else {
+                            val dx = (event.x - lastX) * CURSOR_SENSITIVITY
+                            val dy = (event.y - lastY) * CURSOR_SENSITIVITY
+                            lastX = event.x
+                            lastY = event.y
 
-                        cursorX = (cursorX + dx).coerceIn(0f, rootContainer.width.toFloat())
-                        cursorY = (cursorY + dy).coerceIn(0f, rootContainer.height.toFloat())
-                        updateCursorView()
+                            val totalDist = hypot((event.x - startX).toDouble(), (event.y - startY).toDouble())
+                            if (totalDist > TAP_DISTANCE_THRESHOLD_PX) {
+                                isDragging = true
+                                if (syntheticTouchActive) {
+                                    sendSynthetic(MotionEvent.ACTION_CANCEL, cursorX, cursorY, syntheticDownTime)
+                                    syntheticTouchActive = false
+                                }
+                            }
+
+                            cursorX = (cursorX + dx).coerceIn(0f, rootContainer.width.toFloat())
+                            cursorY = (cursorY + dy).coerceIn(0f, rootContainer.height.toFloat())
+                            updateCursorView()
+                        }
                     }
                 }
 
@@ -384,6 +401,21 @@ class MainActivity : AppCompatActivity() {
         }
         findViewById<TextView>(R.id.btnZoomOut).setOnClickListener { changeZoom(-ZOOM_STEP) }
         findViewById<TextView>(R.id.btnZoomIn).setOnClickListener { changeZoom(ZOOM_STEP) }
+
+        findViewById<TextView>(R.id.btnDragSelect).setOnClickListener { view ->
+            dragSelectModeEnabled = !dragSelectModeEnabled
+            (view as TextView).setTextColor(
+                if (dragSelectModeEnabled) 0xFF4CD964.toInt() else 0xFFFFFFFF.toInt()
+            )
+            Toast.makeText(
+                this,
+                if (dragSelectModeEnabled)
+                    "Drag-select ON: touch = mouse position, drag to select a range"
+                else
+                    "Trackpad mode: drag to move cursor, tap to click",
+                Toast.LENGTH_LONG
+            ).show()
+        }
 
         findViewById<TextView>(R.id.btnCollapseToggle).setOnClickListener { view ->
             val isCurrentlyVisible = toolbarButtons.visibility == View.VISIBLE
