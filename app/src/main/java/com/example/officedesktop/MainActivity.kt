@@ -4,8 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
+import android.os.SystemClock
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
@@ -30,6 +29,15 @@ import kotlin.math.hypot
 
 /**
  * A "desktop in your pocket" browser shell for Office Online (Excel, Word, etc).
+ *
+ * Clicks/right-clicks/scrolling are done by dispatching REAL Android touch
+ * events straight into the WebView (webView.dispatchTouchEvent), rather than
+ * faking mouse events in JavaScript. This matters because Office's UI is
+ * rendered partly inside embedded frames, and JavaScript in the outer page
+ * cannot reach into those (browser security restriction) - but native touch
+ * input, which is routed by the browser engine itself, crosses that boundary
+ * correctly. It also means Chromium's own long-press gesture detection does
+ * the work of showing a real right-click / context menu for us.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -44,17 +52,23 @@ class MainActivity : AppCompatActivity() {
     private var cursorY = 0f
     private var mouseModeEnabled = true
 
-    // Trackpad gesture bookkeeping
-    private var downTime = 0L
+    // Trackpad gesture bookkeeping (moving the visual cursor)
     private var startX = 0f
     private var startY = 0f
     private var lastX = 0f
     private var lastY = 0f
     private var isDragging = false
-    private var longPressFired = false
-    private var lastTapUpTime = 0L
 
-    // Two-finger scroll bookkeeping
+    // The "real" synthetic touch we hold on the WebView representing a
+    // potential click / long-press-right-click at the cursor's position.
+    private var syntheticTouchActive = false
+    private var syntheticDownTime = 0L
+
+    // Two-finger-drag => native scroll, dispatched as a synthetic one-finger drag.
+    private var scrollTouchActive = false
+    private var scrollDownTime = 0L
+    private var scrollPointerX = 0f
+    private var scrollPointerY = 0f
     private var lastFocusX = 0f
     private var lastFocusY = 0f
 
@@ -67,9 +81,6 @@ class MainActivity : AppCompatActivity() {
     // Page zoom (acts like a "resolution" control - shrinks/grows the whole desktop page)
     private var pageZoomPercent = 70
 
-    private val handler = Handler(Looper.getMainLooper())
-    private var longPressRunnable: Runnable? = null
-
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
 
     companion object {
@@ -80,9 +91,6 @@ class MainActivity : AppCompatActivity() {
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
         private const val TAP_DISTANCE_THRESHOLD_PX = 18f
-        private const val TAP_TIME_THRESHOLD_MS = 250L
-        private const val LONG_PRESS_MS = 480L
-        private const val DOUBLE_TAP_MS = 300L
         private const val CURSOR_SENSITIVITY = 1.35f
         private const val FILE_CHOOSER_REQUEST_CODE = 51426
 
@@ -162,7 +170,6 @@ class MainActivity : AppCompatActivity() {
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
-                injectMouseHelperJs()
                 applyPageZoom()
             }
 
@@ -218,84 +225,6 @@ class MainActivity : AppCompatActivity() {
         super.onActivityResult(requestCode, resultCode, data)
     }
 
-    /**
-     * Injects a JS helper that finds the real element under a point - diving
-     * into open shadow roots, since Office's UI (Fluent UI web components)
-     * is built heavily on Shadow DOM - and fires BOTH PointerEvents and
-     * MouseEvents at it, which is what modern Office listens for.
-     */
-    private fun injectMouseHelperJs() {
-        val js = """
-            (function() {
-              function deepElementFromPoint(x, y) {
-                var el = document.elementFromPoint(x, y);
-                var depth = 0;
-                while (el && el.shadowRoot && depth < 25) {
-                  var inner = el.shadowRoot.elementFromPoint(x, y);
-                  if (!inner || inner === el) break;
-                  el = inner;
-                  depth++;
-                }
-                return el;
-              }
-
-              window.__officeVM = function(type, x, y, extra) {
-                var el = deepElementFromPoint(x, y);
-                if (!el) return;
-                var btn = (extra && extra.button) || 0;
-
-                if (type === 'wheel') {
-                  el.dispatchEvent(new WheelEvent('wheel', {
-                    view: window, bubbles: true, cancelable: true, composed: true,
-                    clientX: x, clientY: y, deltaX: extra.dx, deltaY: extra.dy, deltaMode: 0
-                  }));
-                  return;
-                }
-
-                var buttonsVal = (type === 'mousedown' || type === 'pointerdown')
-                  ? (btn === 2 ? 2 : 1) : 0;
-
-                var opts = {
-                  view: window, bubbles: true, cancelable: true, composed: true,
-                  clientX: x, clientY: y, button: btn, buttons: buttonsVal,
-                  pointerType: 'mouse', isPrimary: true, pointerId: 1
-                };
-
-                var pointerMap = { mousedown: 'pointerdown', mouseup: 'pointerup', mousemove: 'pointermove' };
-                if (pointerMap[type]) {
-                  try { el.dispatchEvent(new PointerEvent(pointerMap[type], opts)); } catch (e) {}
-                }
-
-                var ev = new MouseEvent(type, opts);
-                el.dispatchEvent(ev);
-
-                if (type === 'mousedown' && typeof el.focus === 'function') {
-                  try { el.focus(); } catch (e) {}
-                }
-              };
-            })();
-        """.trimIndent()
-        webView.evaluateJavascript(js, null)
-    }
-
-    private fun dispatchMouse(type: String, screenX: Float, screenY: Float, button: Int = 0) {
-        val (cssX, cssY) = toCssCoordinates(screenX, screenY)
-        val js = "window.__officeVM && window.__officeVM('$type', $cssX, $cssY, {button:$button});"
-        webView.evaluateJavascript(js, null)
-    }
-
-    private fun dispatchWheel(screenX: Float, screenY: Float, dx: Float, dy: Float) {
-        val (cssX, cssY) = toCssCoordinates(screenX, screenY)
-        val js = "window.__officeVM && window.__officeVM('wheel', $cssX, $cssY, {dx:$dx, dy:$dy});"
-        webView.evaluateJavascript(js, null)
-    }
-
-    private fun toCssCoordinates(screenX: Float, screenY: Float): Pair<Float, Float> {
-        val density = resources.displayMetrics.density
-        val scale = webView.scale.takeIf { it > 0f } ?: 1f
-        return Pair(screenX / density / scale, screenY / density / scale)
-    }
-
     /** Shrinks/grows the whole page like a resolution/zoom control, so more of a
      *  desktop-sized UI (ribbon, panes, etc.) fits on a phone screen. */
     private fun applyPageZoom() {
@@ -310,7 +239,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ---------------------------------------------------------------------
-    // Virtual trackpad / mouse
+    // Virtual trackpad / mouse - dispatches REAL touch events to the WebView
     // ---------------------------------------------------------------------
 
     private fun updateCursorView() {
@@ -318,26 +247,45 @@ class MainActivity : AppCompatActivity() {
         cursor.y = cursorY - cursor.height / 2f
     }
 
+    private fun sendSynthetic(action: Int, x: Float, y: Float, downTime: Long) {
+        val eventTime = SystemClock.uptimeMillis()
+        val ev = MotionEvent.obtain(downTime, eventTime, action, x, y, 0)
+        webView.dispatchTouchEvent(ev)
+        ev.recycle()
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     private fun setupTrackpad() {
         touchPad.setOnTouchListener { _, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    downTime = System.currentTimeMillis()
                     startX = event.x
                     startY = event.y
                     lastX = event.x
                     lastY = event.y
                     isDragging = false
-                    longPressFired = false
-                    scheduleLongPress()
+
+                    // Hold a live synthetic touch at the cursor's current spot.
+                    // Quick lift -> tap/click. Held still -> Chromium's native
+                    // long-press fires a real right-click/context menu for us.
+                    syntheticDownTime = SystemClock.uptimeMillis()
+                    syntheticTouchActive = true
+                    sendSynthetic(MotionEvent.ACTION_DOWN, cursorX, cursorY, syntheticDownTime)
                 }
 
                 MotionEvent.ACTION_POINTER_DOWN -> {
-                    cancelLongPress()
+                    if (syntheticTouchActive) {
+                        sendSynthetic(MotionEvent.ACTION_CANCEL, cursorX, cursorY, syntheticDownTime)
+                        syntheticTouchActive = false
+                    }
                     if (event.pointerCount == 2) {
                         lastFocusX = (event.getX(0) + event.getX(1)) / 2f
                         lastFocusY = (event.getY(0) + event.getY(1)) / 2f
+                        scrollDownTime = SystemClock.uptimeMillis()
+                        scrollPointerX = cursorX
+                        scrollPointerY = cursorY
+                        scrollTouchActive = true
+                        sendSynthetic(MotionEvent.ACTION_DOWN, scrollPointerX, scrollPointerY, scrollDownTime)
                     }
                 }
 
@@ -349,7 +297,11 @@ class MainActivity : AppCompatActivity() {
                         val dy = fy - lastFocusY
                         lastFocusX = fx
                         lastFocusY = fy
-                        dispatchWheel(cursorX, cursorY, -dx, -dy)
+                        if (scrollTouchActive) {
+                            scrollPointerX = (scrollPointerX + dx).coerceIn(0f, rootContainer.width.toFloat())
+                            scrollPointerY = (scrollPointerY + dy).coerceIn(0f, rootContainer.height.toFloat())
+                            sendSynthetic(MotionEvent.ACTION_MOVE, scrollPointerX, scrollPointerY, scrollDownTime)
+                        }
                     } else {
                         val dx = (event.x - lastX) * CURSOR_SENSITIVITY
                         val dy = (event.y - lastY) * CURSOR_SENSITIVITY
@@ -358,15 +310,16 @@ class MainActivity : AppCompatActivity() {
 
                         val totalDist = hypot((event.x - startX).toDouble(), (event.y - startY).toDouble())
                         if (totalDist > TAP_DISTANCE_THRESHOLD_PX) {
-                            if (!isDragging) cancelLongPress()
                             isDragging = true
+                            if (syntheticTouchActive) {
+                                sendSynthetic(MotionEvent.ACTION_CANCEL, cursorX, cursorY, syntheticDownTime)
+                                syntheticTouchActive = false
+                            }
                         }
 
                         cursorX = (cursorX + dx).coerceIn(0f, rootContainer.width.toFloat())
                         cursorY = (cursorY + dy).coerceIn(0f, rootContainer.height.toFloat())
                         updateCursorView()
-
-                        if (mouseModeEnabled) dispatchMouse("mousemove", cursorX, cursorY)
                     }
                 }
 
@@ -379,51 +332,29 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 MotionEvent.ACTION_UP -> {
-                    cancelLongPress()
-                    val elapsed = System.currentTimeMillis() - downTime
-                    if (mouseModeEnabled && !isDragging && !longPressFired &&
-                        elapsed < TAP_TIME_THRESHOLD_MS
-                    ) {
-                        performClick()
+                    if (scrollTouchActive) {
+                        sendSynthetic(MotionEvent.ACTION_UP, scrollPointerX, scrollPointerY, scrollDownTime)
+                        scrollTouchActive = false
+                    }
+                    if (syntheticTouchActive) {
+                        sendSynthetic(MotionEvent.ACTION_UP, cursorX, cursorY, syntheticDownTime)
+                        syntheticTouchActive = false
                     }
                 }
 
                 MotionEvent.ACTION_CANCEL -> {
-                    cancelLongPress()
+                    if (syntheticTouchActive) {
+                        sendSynthetic(MotionEvent.ACTION_CANCEL, cursorX, cursorY, syntheticDownTime)
+                        syntheticTouchActive = false
+                    }
+                    if (scrollTouchActive) {
+                        sendSynthetic(MotionEvent.ACTION_CANCEL, scrollPointerX, scrollPointerY, scrollDownTime)
+                        scrollTouchActive = false
+                    }
                 }
             }
             true
         }
-    }
-
-    private fun scheduleLongPress() {
-        cancelLongPress()
-        val runnable = Runnable {
-            if (!isDragging) {
-                longPressFired = true
-                dispatchMouse("mousedown", cursorX, cursorY, 2)
-                dispatchMouse("contextmenu", cursorX, cursorY, 2)
-                dispatchMouse("mouseup", cursorX, cursorY, 2)
-            }
-        }
-        longPressRunnable = runnable
-        handler.postDelayed(runnable, LONG_PRESS_MS)
-    }
-
-    private fun cancelLongPress() {
-        longPressRunnable?.let { handler.removeCallbacks(it) }
-        longPressRunnable = null
-    }
-
-    private fun performClick() {
-        val now = System.currentTimeMillis()
-        val isDoubleTap = (now - lastTapUpTime) < DOUBLE_TAP_MS
-        lastTapUpTime = now
-
-        dispatchMouse("mousedown", cursorX, cursorY, 0)
-        dispatchMouse("mouseup", cursorX, cursorY, 0)
-        dispatchMouse("click", cursorX, cursorY, 0)
-        if (isDoubleTap) dispatchMouse("dblclick", cursorX, cursorY, 0)
     }
 
     // ---------------------------------------------------------------------
@@ -455,9 +386,9 @@ class MainActivity : AppCompatActivity() {
         findViewById<TextView>(R.id.btnZoomIn).setOnClickListener { changeZoom(ZOOM_STEP) }
 
         findViewById<TextView>(R.id.btnCollapseToggle).setOnClickListener { view ->
-            val collapsed = toolbarButtons.visibility == View.VISIBLE
-            toolbarButtons.visibility = if (collapsed) View.GONE else View.VISIBLE
-            (view as TextView).text = if (collapsed) "▸" else "◂"
+            val isCurrentlyVisible = toolbarButtons.visibility == View.VISIBLE
+            toolbarButtons.visibility = if (isCurrentlyVisible) View.GONE else View.VISIBLE
+            (view as TextView).text = if (isCurrentlyVisible) ">" else "<"
         }
     }
 
