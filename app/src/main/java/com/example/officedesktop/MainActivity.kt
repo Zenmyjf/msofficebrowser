@@ -267,6 +267,17 @@ class MainActivity : AppCompatActivity() {
         touchPad.setOnTouchListener { _, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    if (dragSelectModeEnabled) {
+                        // Excel only recognizes a range-selection drag if the touch
+                        // tracks your finger exactly (like a real touchscreen drag) -
+                        // a dampened/relative movement gets treated as an ordinary
+                        // page scroll instead. So here the cursor jumps straight to
+                        // your finger's position rather than carrying over from
+                        // wherever it was.
+                        cursorX = event.x.coerceIn(0f, rootContainer.width.toFloat())
+                        cursorY = event.y.coerceIn(0f, rootContainer.height.toFloat())
+                        updateCursorView()
+                    }
                     startX = event.x
                     startY = event.y
                     lastX = event.x
@@ -313,18 +324,26 @@ class MainActivity : AppCompatActivity() {
                             sendSynthetic(MotionEvent.ACTION_MOVE, scrollPointerX, scrollPointerY, scrollDownTime)
                         }
                     } else {
-                        val dx = (event.x - lastX) * CURSOR_SENSITIVITY
-                        val dy = (event.y - lastY) * CURSOR_SENSITIVITY
-                        lastX = event.x
-                        lastY = event.y
-
                         val totalDist = hypot((event.x - startX).toDouble(), (event.y - startY).toDouble())
                         if (totalDist > TAP_DISTANCE_THRESHOLD_PX) {
                             isDragging = true
                         }
 
-                        cursorX = (cursorX + dx).coerceIn(0f, rootContainer.width.toFloat())
-                        cursorY = (cursorY + dy).coerceIn(0f, rootContainer.height.toFloat())
+                        if (dragSelectModeEnabled) {
+                            // Direct 1:1 tracking: the cursor follows your finger
+                            // exactly, at the same speed - this is what Excel needs
+                            // to recognize the gesture as a real drag-select instead
+                            // of falling back to plain page scrolling.
+                            cursorX = event.x.coerceIn(0f, rootContainer.width.toFloat())
+                            cursorY = event.y.coerceIn(0f, rootContainer.height.toFloat())
+                        } else {
+                            val dx = (event.x - lastX) * CURSOR_SENSITIVITY
+                            val dy = (event.y - lastY) * CURSOR_SENSITIVITY
+                            cursorX = (cursorX + dx).coerceIn(0f, rootContainer.width.toFloat())
+                            cursorY = (cursorY + dy).coerceIn(0f, rootContainer.height.toFloat())
+                        }
+                        lastX = event.x
+                        lastY = event.y
                         updateCursorView()
 
                         if (isDragging) {
