@@ -4,7 +4,10 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
+import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
@@ -30,14 +33,12 @@ import kotlin.math.hypot
 /**
  * A "desktop in your pocket" browser shell for Office Online (Excel, Word, etc).
  *
- * Clicks/right-clicks/scrolling are done by dispatching REAL Android touch
- * events straight into the WebView (webView.dispatchTouchEvent), rather than
- * faking mouse events in JavaScript. This matters because Office's UI is
- * rendered partly inside embedded frames, and JavaScript in the outer page
- * cannot reach into those (browser security restriction) - but native touch
- * input, which is routed by the browser engine itself, crosses that boundary
- * correctly. It also means Chromium's own long-press gesture detection does
- * the work of showing a real right-click / context menu for us.
+ * Clicks/drags/right-clicks are dispatched as REAL Android MotionEvents tagged
+ * with TOOL_TYPE_MOUSE and SOURCE_MOUSE (not a finger/touchscreen). Chromium
+ * inspects that tag and treats the input as an actual mouse: plain rectangle
+ * drag-selection (no touch handles), real secondary-button right-clicks, etc.
+ * Native input dispatch (as opposed to JavaScript-synthesized events) is also
+ * what lets this reach into Office's embedded content frames correctly.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -60,12 +61,16 @@ class MainActivity : AppCompatActivity() {
     private var lastY = 0f
     private var isDragging = false
 
-    // The "real" synthetic touch we hold on the WebView representing a
-    // potential click / long-press-right-click at the cursor's position.
-    private var syntheticTouchActive = false
+    // The synthetic "mouse button" we're holding down, representing a
+    // potential left-click / drag-select / (converted) right-click.
+    private var leftButtonDownActive = false
     private var syntheticDownTime = 0L
 
-    // Two-finger-drag => native scroll, dispatched as a synthetic one-finger drag.
+    private val handler = Handler(Looper.getMainLooper())
+    private var longPressRunnable: Runnable? = null
+
+    // Two-finger-drag => native touch scroll (kept as real touch, not mouse,
+    // since scrolling is a natural touch gesture).
     private var scrollTouchActive = false
     private var scrollDownTime = 0L
     private var scrollPointerX = 0f
@@ -94,6 +99,7 @@ class MainActivity : AppCompatActivity() {
         private const val TAP_DISTANCE_THRESHOLD_PX = 18f
         private const val CURSOR_SENSITIVITY = 1.35f
         private const val FILE_CHOOSER_REQUEST_CODE = 51426
+        private const val LONG_PRESS_MS = 450L
 
         private const val ZOOM_MIN = 30
         private const val ZOOM_MAX = 150
@@ -240,19 +246,51 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ---------------------------------------------------------------------
-    // Virtual trackpad / mouse - dispatches REAL touch events to the WebView
+    // Virtual mouse - dispatches REAL, mouse-classified MotionEvents to the WebView
     // ---------------------------------------------------------------------
 
     private fun updateCursorView() {
-        cursor.x = cursorX - cursor.width / 2f
-        cursor.y = cursorY - cursor.height / 2f
+        // The arrow icon's tip sits near the top-left of its bounding box,
+        // so aligning the view's top-left with the cursor position puts the
+        // TIP (not the center) at the coordinate that actually gets clicked.
+        cursor.x = cursorX
+        cursor.y = cursorY
     }
 
-    private fun sendSynthetic(action: Int, x: Float, y: Float, downTime: Long) {
+    /** Dispatches a MotionEvent tagged as coming from a real mouse (TOOL_TYPE_MOUSE /
+     *  SOURCE_MOUSE), so Chromium treats it as an actual mouse click/drag instead of
+     *  a finger touch - giving plain rectangle drag-selection and real right-clicks. */
+    private fun sendSyntheticMouse(action: Int, x: Float, y: Float, downTime: Long, buttonState: Int) {
+        val eventTime = SystemClock.uptimeMillis()
+        val props = arrayOf(MotionEvent.PointerProperties().apply {
+            id = 0
+            toolType = MotionEvent.TOOL_TYPE_MOUSE
+        })
+        val coords = arrayOf(MotionEvent.PointerCoords().apply {
+            this.x = x
+            this.y = y
+            pressure = 1f
+            size = 1f
+        })
+        val event = MotionEvent.obtain(
+            downTime, eventTime, action, 1, props, coords,
+            0, buttonState, 1f, 1f, 0, 0, InputDevice.SOURCE_MOUSE, 0
+        )
+        webView.dispatchTouchEvent(event)
+        event.recycle()
+    }
+
+    /** Plain finger-touch dispatch, used only for two-finger scrolling. */
+    private fun sendSyntheticTouch(action: Int, x: Float, y: Float, downTime: Long) {
         val eventTime = SystemClock.uptimeMillis()
         val ev = MotionEvent.obtain(downTime, eventTime, action, x, y, 0)
         webView.dispatchTouchEvent(ev)
         ev.recycle()
+    }
+
+    private fun cancelLongPress() {
+        longPressRunnable?.let { handler.removeCallbacks(it) }
+        longPressRunnable = null
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -271,18 +309,34 @@ class MainActivity : AppCompatActivity() {
                     lastY = event.y
                     isDragging = false
 
-                    // Hold a live synthetic touch at the cursor's current spot.
-                    // Quick lift -> tap/click. Held still -> Chromium's native
-                    // long-press fires a real right-click/context menu for us.
                     syntheticDownTime = SystemClock.uptimeMillis()
-                    syntheticTouchActive = true
-                    sendSynthetic(MotionEvent.ACTION_DOWN, cursorX, cursorY, syntheticDownTime)
+                    leftButtonDownActive = true
+                    sendSyntheticMouse(
+                        MotionEvent.ACTION_DOWN, cursorX, cursorY,
+                        syntheticDownTime, MotionEvent.BUTTON_PRIMARY
+                    )
+
+                    // If the finger stays put long enough without moving, convert
+                    // the held left button into a real right-click.
+                    cancelLongPress()
+                    val runnable = Runnable {
+                        if (leftButtonDownActive && !isDragging) {
+                            sendSyntheticMouse(MotionEvent.ACTION_UP, cursorX, cursorY, syntheticDownTime, 0)
+                            val rDownTime = SystemClock.uptimeMillis()
+                            sendSyntheticMouse(MotionEvent.ACTION_DOWN, cursorX, cursorY, rDownTime, MotionEvent.BUTTON_SECONDARY)
+                            sendSyntheticMouse(MotionEvent.ACTION_UP, cursorX, cursorY, rDownTime, 0)
+                            leftButtonDownActive = false
+                        }
+                    }
+                    longPressRunnable = runnable
+                    handler.postDelayed(runnable, LONG_PRESS_MS)
                 }
 
                 MotionEvent.ACTION_POINTER_DOWN -> {
-                    if (syntheticTouchActive) {
-                        sendSynthetic(MotionEvent.ACTION_CANCEL, cursorX, cursorY, syntheticDownTime)
-                        syntheticTouchActive = false
+                    cancelLongPress()
+                    if (leftButtonDownActive) {
+                        sendSyntheticMouse(MotionEvent.ACTION_CANCEL, cursorX, cursorY, syntheticDownTime, 0)
+                        leftButtonDownActive = false
                     }
                     if (event.pointerCount == 2) {
                         lastFocusX = (event.getX(0) + event.getX(1)) / 2f
@@ -291,7 +345,7 @@ class MainActivity : AppCompatActivity() {
                         scrollPointerX = cursorX
                         scrollPointerY = cursorY
                         scrollTouchActive = true
-                        sendSynthetic(MotionEvent.ACTION_DOWN, scrollPointerX, scrollPointerY, scrollDownTime)
+                        sendSyntheticTouch(MotionEvent.ACTION_DOWN, scrollPointerX, scrollPointerY, scrollDownTime)
                     }
                 }
 
@@ -306,37 +360,50 @@ class MainActivity : AppCompatActivity() {
                         if (scrollTouchActive) {
                             scrollPointerX = (scrollPointerX + dx).coerceIn(0f, rootContainer.width.toFloat())
                             scrollPointerY = (scrollPointerY + dy).coerceIn(0f, rootContainer.height.toFloat())
-                            sendSynthetic(MotionEvent.ACTION_MOVE, scrollPointerX, scrollPointerY, scrollDownTime)
+                            sendSyntheticTouch(MotionEvent.ACTION_MOVE, scrollPointerX, scrollPointerY, scrollDownTime)
+                        }
+                    } else if (dragSelectModeEnabled) {
+                        // Absolute mode: mouse follows your finger exactly and stays
+                        // "held down" the whole time -> a genuine mouse drag-select.
+                        cursorX = event.x.coerceIn(0f, rootContainer.width.toFloat())
+                        cursorY = event.y.coerceIn(0f, rootContainer.height.toFloat())
+                        updateCursorView()
+
+                        val totalDist = hypot((event.x - startX).toDouble(), (event.y - startY).toDouble())
+                        if (totalDist > TAP_DISTANCE_THRESHOLD_PX) {
+                            if (!isDragging) cancelLongPress()
+                            isDragging = true
+                        }
+
+                        if (leftButtonDownActive) {
+                            sendSyntheticMouse(
+                                MotionEvent.ACTION_MOVE, cursorX, cursorY,
+                                syntheticDownTime, MotionEvent.BUTTON_PRIMARY
+                            )
                         }
                     } else {
-                        if (dragSelectModeEnabled) {
-                            // Absolute mode: the mouse follows your finger exactly,
-                            // and stays "held down" the whole time -> real drag-select.
-                            cursorX = event.x.coerceIn(0f, rootContainer.width.toFloat())
-                            cursorY = event.y.coerceIn(0f, rootContainer.height.toFloat())
-                            updateCursorView()
-                            if (syntheticTouchActive) {
-                                sendSynthetic(MotionEvent.ACTION_MOVE, cursorX, cursorY, syntheticDownTime)
-                            }
-                        } else {
-                            val dx = (event.x - lastX) * CURSOR_SENSITIVITY
-                            val dy = (event.y - lastY) * CURSOR_SENSITIVITY
-                            lastX = event.x
-                            lastY = event.y
+                        // Trackpad mode: finger movement repositions the cursor only;
+                        // it does not drag the page content.
+                        val dx = (event.x - lastX) * CURSOR_SENSITIVITY
+                        val dy = (event.y - lastY) * CURSOR_SENSITIVITY
+                        lastX = event.x
+                        lastY = event.y
 
-                            val totalDist = hypot((event.x - startX).toDouble(), (event.y - startY).toDouble())
-                            if (totalDist > TAP_DISTANCE_THRESHOLD_PX) {
-                                isDragging = true
-                                if (syntheticTouchActive) {
-                                    sendSynthetic(MotionEvent.ACTION_CANCEL, cursorX, cursorY, syntheticDownTime)
-                                    syntheticTouchActive = false
+                        val totalDist = hypot((event.x - startX).toDouble(), (event.y - startY).toDouble())
+                        if (totalDist > TAP_DISTANCE_THRESHOLD_PX) {
+                            if (!isDragging) {
+                                cancelLongPress()
+                                if (leftButtonDownActive) {
+                                    sendSyntheticMouse(MotionEvent.ACTION_CANCEL, cursorX, cursorY, syntheticDownTime, 0)
+                                    leftButtonDownActive = false
                                 }
                             }
-
-                            cursorX = (cursorX + dx).coerceIn(0f, rootContainer.width.toFloat())
-                            cursorY = (cursorY + dy).coerceIn(0f, rootContainer.height.toFloat())
-                            updateCursorView()
+                            isDragging = true
                         }
+
+                        cursorX = (cursorX + dx).coerceIn(0f, rootContainer.width.toFloat())
+                        cursorY = (cursorY + dy).coerceIn(0f, rootContainer.height.toFloat())
+                        updateCursorView()
                     }
                 }
 
@@ -349,23 +416,25 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 MotionEvent.ACTION_UP -> {
+                    cancelLongPress()
                     if (scrollTouchActive) {
-                        sendSynthetic(MotionEvent.ACTION_UP, scrollPointerX, scrollPointerY, scrollDownTime)
+                        sendSyntheticTouch(MotionEvent.ACTION_UP, scrollPointerX, scrollPointerY, scrollDownTime)
                         scrollTouchActive = false
                     }
-                    if (syntheticTouchActive) {
-                        sendSynthetic(MotionEvent.ACTION_UP, cursorX, cursorY, syntheticDownTime)
-                        syntheticTouchActive = false
+                    if (leftButtonDownActive) {
+                        sendSyntheticMouse(MotionEvent.ACTION_UP, cursorX, cursorY, syntheticDownTime, 0)
+                        leftButtonDownActive = false
                     }
                 }
 
                 MotionEvent.ACTION_CANCEL -> {
-                    if (syntheticTouchActive) {
-                        sendSynthetic(MotionEvent.ACTION_CANCEL, cursorX, cursorY, syntheticDownTime)
-                        syntheticTouchActive = false
+                    cancelLongPress()
+                    if (leftButtonDownActive) {
+                        sendSyntheticMouse(MotionEvent.ACTION_CANCEL, cursorX, cursorY, syntheticDownTime, 0)
+                        leftButtonDownActive = false
                     }
                     if (scrollTouchActive) {
-                        sendSynthetic(MotionEvent.ACTION_CANCEL, scrollPointerX, scrollPointerY, scrollDownTime)
+                        sendSyntheticTouch(MotionEvent.ACTION_CANCEL, scrollPointerX, scrollPointerY, scrollDownTime)
                         scrollTouchActive = false
                     }
                 }
