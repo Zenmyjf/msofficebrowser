@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
@@ -30,18 +31,20 @@ import kotlin.math.hypot
 /**
  * A "desktop in your pocket" browser shell for Office Online (Excel, Word, etc).
  *
- * Clicks/drags/scrolling are dispatched as REAL Android touch MotionEvents
- * straight into the WebView (webView.dispatchTouchEvent), rather than faking
- * mouse events in JavaScript - JS in the outer page cannot reach into Office's
- * embedded content frames, but native touch input (routed by the browser
- * engine itself) crosses that boundary correctly.
+ * Clicks/right-clicks/scrolling are dispatched as REAL Android touch
+ * MotionEvents straight into the WebView (webView.dispatchTouchEvent), rather
+ * than faking mouse events in JavaScript - JS in the outer page cannot reach
+ * into Office's embedded content frames, but native touch input (routed by
+ * the browser engine itself) crosses that boundary correctly.
  *
- * The cursor always moves the SAME way (relative to your finger, starting
- * from wherever it currently is) whether "drag-select" mode is on or off -
- * it never snaps/teleports to your finger's touch point. The only difference
- * drag-select mode makes is: when you drag, it keeps the touch "held down"
- * and moving with the cursor (a real click-and-drag range selection) instead
- * of canceling it (plain cursor repositioning).
+ * The cursor ALWAYS moves the same way (relative to your finger, starting
+ * from wherever it currently is) - it never snaps/teleports, in any mode.
+ *
+ * Range selection ("SEL") works the same way it does on a real desktop:
+ * click the first cell, then Shift+click the last cell. Tapping the SEL
+ * button "arms" a virtual Shift key for your very next tap only, then
+ * disarms itself automatically - no dragging involved, so the cursor
+ * behaves identically whether SEL is armed or not.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -51,11 +54,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var rootContainer: FrameLayout
     private lateinit var toolbar: View
     private lateinit var toolbarButtons: View
+    private lateinit var dragSelectButton: TextView
 
     private var cursorX = 0f
     private var cursorY = 0f
     private var mouseModeEnabled = true
-    private var dragSelectModeEnabled = false
+
+    // True while the SEL button is armed - the next completed tap will be
+    // dispatched with a virtual Shift key held (extends the selection).
+    private var shiftClickArmed = false
+    // Captured at the start of each touch gesture, so a gesture that began
+    // while armed still completes as a shift-click even if disarmed mid-way.
+    private var gestureIsShiftClick = false
 
     // Trackpad gesture bookkeeping (moving the visual cursor)
     private var startX = 0f
@@ -65,7 +75,7 @@ class MainActivity : AppCompatActivity() {
     private var isDragging = false
 
     // The touch we're holding "down" on the WebView, representing a
-    // potential click / long-press-right-click / drag-select.
+    // potential click / long-press-right-click.
     private var syntheticTouchActive = false
     private var syntheticDownTime = 0L
 
@@ -117,6 +127,7 @@ class MainActivity : AppCompatActivity() {
         touchPad = findViewById(R.id.touchPad)
         toolbar = findViewById(R.id.toolbar)
         toolbarButtons = findViewById(R.id.toolbarButtons)
+        dragSelectButton = findViewById(R.id.btnDragSelect)
 
         setupWebView()
         setupTrackpad()
@@ -243,6 +254,11 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "Zoom: $pageZoomPercent%", Toast.LENGTH_SHORT).show()
     }
 
+    private fun disarmShiftClick() {
+        shiftClickArmed = false
+        dragSelectButton.setTextColor(0xFFFFFFFF.toInt())
+    }
+
     // ---------------------------------------------------------------------
     // Virtual trackpad / mouse - dispatches REAL touch events to the WebView
     // ---------------------------------------------------------------------
@@ -255,9 +271,9 @@ class MainActivity : AppCompatActivity() {
         cursor.y = cursorY
     }
 
-    private fun sendSynthetic(action: Int, x: Float, y: Float, downTime: Long) {
+    private fun sendSynthetic(action: Int, x: Float, y: Float, downTime: Long, metaState: Int = 0) {
         val eventTime = SystemClock.uptimeMillis()
-        val ev = MotionEvent.obtain(downTime, eventTime, action, x, y, 0)
+        val ev = MotionEvent.obtain(downTime, eventTime, action, x, y, metaState)
         webView.dispatchTouchEvent(ev)
         ev.recycle()
     }
@@ -267,31 +283,26 @@ class MainActivity : AppCompatActivity() {
         touchPad.setOnTouchListener { _, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    if (dragSelectModeEnabled) {
-                        // Excel only recognizes a range-selection drag if the touch
-                        // tracks your finger exactly (like a real touchscreen drag) -
-                        // a dampened/relative movement gets treated as an ordinary
-                        // page scroll instead. So here the cursor jumps straight to
-                        // your finger's position rather than carrying over from
-                        // wherever it was.
-                        cursorX = event.x.coerceIn(0f, rootContainer.width.toFloat())
-                        cursorY = event.y.coerceIn(0f, rootContainer.height.toFloat())
-                        updateCursorView()
-                    }
+                    // Lock in whether this whole gesture is a shift-click, so
+                    // toggling SEL mid-gesture can't change it partway through.
+                    gestureIsShiftClick = shiftClickArmed
+
                     startX = event.x
                     startY = event.y
                     lastX = event.x
                     lastY = event.y
                     isDragging = false
 
-                    // Hold a live touch at the cursor's current spot (never at the
-                    // finger's touch point - the cursor only ever moves relative to
-                    // finger movement, so it never jumps/teleports). Quick lift ->
-                    // tap/click. Held still -> Chromium's native long-press fires a
-                    // real right-click/context menu for us.
+                    // Hold a live touch at the cursor's current spot - the cursor
+                    // only ever moves relative to finger movement, never jumping
+                    // to the touch point. Quick lift -> tap/click. Held still ->
+                    // Chromium's native long-press fires a real right-click for us.
                     syntheticDownTime = SystemClock.uptimeMillis()
                     syntheticTouchActive = true
-                    sendSynthetic(MotionEvent.ACTION_DOWN, cursorX, cursorY, syntheticDownTime)
+                    sendSynthetic(
+                        MotionEvent.ACTION_DOWN, cursorX, cursorY, syntheticDownTime,
+                        if (gestureIsShiftClick) KeyEvent.META_SHIFT_ON else 0
+                    )
                 }
 
                 MotionEvent.ACTION_POINTER_DOWN -> {
@@ -324,42 +335,26 @@ class MainActivity : AppCompatActivity() {
                             sendSynthetic(MotionEvent.ACTION_MOVE, scrollPointerX, scrollPointerY, scrollDownTime)
                         }
                     } else {
+                        // Cursor ALWAYS moves relative to your finger, starting from
+                        // wherever it currently is - identical behavior regardless
+                        // of SEL state. It never jumps to the touch point.
+                        val dx = (event.x - lastX) * CURSOR_SENSITIVITY
+                        val dy = (event.y - lastY) * CURSOR_SENSITIVITY
+                        lastX = event.x
+                        lastY = event.y
+
                         val totalDist = hypot((event.x - startX).toDouble(), (event.y - startY).toDouble())
                         if (totalDist > TAP_DISTANCE_THRESHOLD_PX) {
                             isDragging = true
-                        }
-
-                        if (dragSelectModeEnabled) {
-                            // Direct 1:1 tracking: the cursor follows your finger
-                            // exactly, at the same speed - this is what Excel needs
-                            // to recognize the gesture as a real drag-select instead
-                            // of falling back to plain page scrolling.
-                            cursorX = event.x.coerceIn(0f, rootContainer.width.toFloat())
-                            cursorY = event.y.coerceIn(0f, rootContainer.height.toFloat())
-                        } else {
-                            val dx = (event.x - lastX) * CURSOR_SENSITIVITY
-                            val dy = (event.y - lastY) * CURSOR_SENSITIVITY
-                            cursorX = (cursorX + dx).coerceIn(0f, rootContainer.width.toFloat())
-                            cursorY = (cursorY + dy).coerceIn(0f, rootContainer.height.toFloat())
-                        }
-                        lastX = event.x
-                        lastY = event.y
-                        updateCursorView()
-
-                        if (isDragging) {
-                            if (dragSelectModeEnabled) {
-                                // Keep the touch "held down" and move it along with the
-                                // cursor -> a real click-and-drag range selection.
-                                if (syntheticTouchActive) {
-                                    sendSynthetic(MotionEvent.ACTION_MOVE, cursorX, cursorY, syntheticDownTime)
-                                }
-                            } else if (syntheticTouchActive) {
-                                // Trackpad mode: dragging only repositions the cursor,
-                                // it must not drag/select the page content.
+                            if (syntheticTouchActive) {
                                 sendSynthetic(MotionEvent.ACTION_CANCEL, cursorX, cursorY, syntheticDownTime)
                                 syntheticTouchActive = false
                             }
                         }
+
+                        cursorX = (cursorX + dx).coerceIn(0f, rootContainer.width.toFloat())
+                        cursorY = (cursorY + dy).coerceIn(0f, rootContainer.height.toFloat())
+                        updateCursorView()
                     }
                 }
 
@@ -377,8 +372,14 @@ class MainActivity : AppCompatActivity() {
                         scrollTouchActive = false
                     }
                     if (syntheticTouchActive) {
-                        sendSynthetic(MotionEvent.ACTION_UP, cursorX, cursorY, syntheticDownTime)
+                        sendSynthetic(
+                            MotionEvent.ACTION_UP, cursorX, cursorY, syntheticDownTime,
+                            if (gestureIsShiftClick) KeyEvent.META_SHIFT_ON else 0
+                        )
                         syntheticTouchActive = false
+                        // A real click/tap completed - if it was armed as a
+                        // shift-click, that job is done, so disarm automatically.
+                        if (gestureIsShiftClick) disarmShiftClick()
                     }
                 }
 
@@ -425,17 +426,17 @@ class MainActivity : AppCompatActivity() {
         findViewById<TextView>(R.id.btnZoomOut).setOnClickListener { changeZoom(-ZOOM_STEP) }
         findViewById<TextView>(R.id.btnZoomIn).setOnClickListener { changeZoom(ZOOM_STEP) }
 
-        findViewById<TextView>(R.id.btnDragSelect).setOnClickListener { view ->
-            dragSelectModeEnabled = !dragSelectModeEnabled
-            (view as TextView).setTextColor(
-                if (dragSelectModeEnabled) 0xFF4CD964.toInt() else 0xFFFFFFFF.toInt()
+        dragSelectButton.setOnClickListener {
+            shiftClickArmed = !shiftClickArmed
+            dragSelectButton.setTextColor(
+                if (shiftClickArmed) 0xFF4CD964.toInt() else 0xFFFFFFFF.toInt()
             )
             Toast.makeText(
                 this,
-                if (dragSelectModeEnabled)
-                    "Drag-select ON: drag the cursor to select a range"
+                if (shiftClickArmed)
+                    "Range-select armed: tap the end cell to select the range"
                 else
-                    "Trackpad mode: drag to move cursor, tap to click",
+                    "Range-select cancelled",
                 Toast.LENGTH_LONG
             ).show()
         }
