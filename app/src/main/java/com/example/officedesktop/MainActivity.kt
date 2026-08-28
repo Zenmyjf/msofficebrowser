@@ -67,6 +67,10 @@ class MainActivity : AppCompatActivity() {
     // Captured at the start of each touch gesture, so a gesture that began
     // while armed still completes as a held-drag even if disarmed mid-way.
     private var gestureIsDragHold = false
+    // Whether THIS gesture should behave as a held-drag - either because SEL
+    // was armed, or because you paused briefly before starting to drag (a
+    // deliberate "press, then drag" instead of an immediate swipe).
+    private var effectiveDragHold = false
 
     // Trackpad gesture bookkeeping (moving the visual cursor)
     private var startX = 0f
@@ -109,6 +113,7 @@ class MainActivity : AppCompatActivity() {
         private const val TAP_DISTANCE_THRESHOLD_PX = 18f
         private const val CURSOR_SENSITIVITY = 1.35f
         private const val FILE_CHOOSER_REQUEST_CODE = 51426
+        private const val HOLD_ENGAGE_MS = 180L
 
         private const val ZOOM_MIN = 30
         private const val ZOOM_MAX = 150
@@ -287,6 +292,7 @@ class MainActivity : AppCompatActivity() {
                     // Lock in whether this whole gesture is a held-drag, so
                     // toggling SEL mid-gesture can't change it partway through.
                     gestureIsDragHold = dragHoldArmed
+                    effectiveDragHold = dragHoldArmed
 
                     startX = event.x
                     startY = event.y
@@ -343,6 +349,14 @@ class MainActivity : AppCompatActivity() {
 
                         val totalDist = hypot((event.x - startX).toDouble(), (event.y - startY).toDouble())
                         if (totalDist > TAP_DISTANCE_THRESHOLD_PX) {
+                            if (!isDragging) {
+                                // A brief pause before the drag started (a deliberate
+                                // "press, then drag" rather than an immediate swipe)
+                                // automatically counts as a held-drag too - no need
+                                // to tap SEL first for the common case.
+                                val heldBeforeDragging = SystemClock.uptimeMillis() - syntheticDownTime >= HOLD_ENGAGE_MS
+                                if (heldBeforeDragging) effectiveDragHold = true
+                            }
                             isDragging = true
                         }
 
@@ -351,7 +365,7 @@ class MainActivity : AppCompatActivity() {
                         updateCursorView()
 
                         if (isDragging && syntheticTouchActive) {
-                            if (gestureIsDragHold) {
+                            if (effectiveDragHold) {
                                 // Keep the touch "held down" and move it along with
                                 // the cursor - this is what lets you grab a small
                                 // selection-handle circle and drag it, exactly like
