@@ -47,12 +47,15 @@ import kotlin.math.hypot
  * long-press detection fires a real right-click/context menu for us, since
  * we just keep a live touch held at the cursor's position without canceling.
  *
- * Grab-and-drag (for dragging a selection-handle circle, or any other
- * press-and-drag target): DOUBLE-TAP, and on the second tap, don't lift -
- * start dragging immediately. That keeps the touch "held down" and moving
- * with the cursor for the whole drag, instead of the normal single-drag
- * behavior of just repositioning the cursor. This mirrors how many Android
- * text editors handle "double-tap-and-drag to fine-tune a selection".
+ * Grab-and-drag (for dragging a selection-handle circle, a fill handle, or
+ * any other press-and-drag target): either (a) DOUBLE-TAP, and on the second
+ * tap, don't lift - start dragging immediately, or (b) press, pause briefly,
+ * then drag, all in one continuous touch without lifting. Either one keeps
+ * the touch "held down" and moving with the cursor for the whole drag,
+ * instead of the normal single-drag behavior of just repositioning the
+ * cursor. Having both matters because some targets (like Excel's fill
+ * handle) treat an actual double-click as its own separate action, so the
+ * press-and-pause method is the one to use there.
  * =============================================================================
  */
 class MainActivity : AppCompatActivity() {
@@ -123,6 +126,12 @@ class MainActivity : AppCompatActivity() {
         private const val QUICK_TAP_MAX_MS = 280L
         // How soon the second tap must begin after the first one ends.
         private const val DOUBLE_TAP_WINDOW_MS = 350L
+        // Alternative grab-and-drag trigger: press, pause at least this long
+        // (but well under the right-click hold time), then drag - all in one
+        // continuous touch. Useful when double-tapping a target would trigger
+        // its own separate action (e.g. double-clicking a fill handle
+        // instantly auto-fills, instead of letting you drag it).
+        private const val HOLD_ENGAGE_MS = 180L
 
         private const val ZOOM_MIN = 30
         private const val ZOOM_MAX = 150
@@ -369,6 +378,15 @@ class MainActivity : AppCompatActivity() {
 
                         val totalDist = hypot((event.x - startX).toDouble(), (event.y - startY).toDouble())
                         if (totalDist > TAP_DISTANCE_THRESHOLD_PX) {
+                            if (!isDragging && !gestureIsGrabDrag) {
+                                // Alternative trigger: didn't start as the second tap
+                                // of a double-tap, but you paused briefly before
+                                // dragging (a deliberate "press, then drag") - treat
+                                // that as a grab-and-drag too.
+                                val heldBeforeDragging =
+                                    SystemClock.uptimeMillis() - syntheticDownTime >= HOLD_ENGAGE_MS
+                                if (heldBeforeDragging) gestureIsGrabDrag = true
+                            }
                             isDragging = true
                         }
 
