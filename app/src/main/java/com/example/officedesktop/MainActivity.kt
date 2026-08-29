@@ -30,20 +30,30 @@ import kotlin.math.hypot
 /**
  * A "desktop in your pocket" browser shell for Office Online (Excel, Word, etc).
  *
- * Clicks/right-clicks/scrolling are dispatched as REAL Android touch
- * MotionEvents straight into the WebView (webView.dispatchTouchEvent), rather
- * than faking mouse events in JavaScript - JS in the outer page cannot reach
- * into Office's embedded content frames, but native touch input (routed by
- * the browser engine itself) crosses that boundary correctly.
+ * ============================== VIRTUAL MOUSE ==============================
+ * Everything is dispatched as REAL Android touch MotionEvents straight into
+ * the WebView (webView.dispatchTouchEvent), rather than faking mouse events
+ * in JavaScript - JS in the outer page cannot reach into Office's embedded
+ * content frames, but native touch input (routed by the browser engine
+ * itself) crosses that boundary correctly.
  *
- * The cursor ALWAYS moves the same way (relative to your finger, starting
- * from wherever it currently is) - it never snaps/teleports, in any mode.
+ * Cursor movement: ALWAYS relative to your finger, starting from wherever the
+ * cursor currently is. It never jumps/teleports to your finger's touch point,
+ * in any situation.
  *
- * Range selection ("SEL") works the same way it does on a real desktop:
- * click the first cell, then Shift+click the last cell. Tapping the SEL
- * button "arms" a virtual Shift key for your very next tap only, then
- * disarms itself automatically - no dragging involved, so the cursor
- * behaves identically whether SEL is armed or not.
+ * Left click: a quick tap (little movement, released quickly).
+ *
+ * Right click: press and hold still (don't drag) - Chromium's own native
+ * long-press detection fires a real right-click/context menu for us, since
+ * we just keep a live touch held at the cursor's position without canceling.
+ *
+ * Grab-and-drag (for dragging a selection-handle circle, or any other
+ * press-and-drag target): DOUBLE-TAP, and on the second tap, don't lift -
+ * start dragging immediately. That keeps the touch "held down" and moving
+ * with the cursor for the whole drag, instead of the normal single-drag
+ * behavior of just repositioning the cursor. This mirrors how many Android
+ * text editors handle "double-tap-and-drag to fine-tune a selection".
+ * =============================================================================
  */
 class MainActivity : AppCompatActivity() {
 
@@ -53,24 +63,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var rootContainer: FrameLayout
     private lateinit var toolbar: View
     private lateinit var toolbarButtons: View
-    private lateinit var dragSelectButton: TextView
 
     private var cursorX = 0f
     private var cursorY = 0f
     private var mouseModeEnabled = true
-
-    // True while the SEL button is armed - the NEXT press-and-drag will keep
-    // the touch held down and moving with the cursor the whole time (so you
-    // can grab a selection-handle circle and drag it), instead of the normal
-    // trackpad behavior of releasing the touch as soon as you start dragging.
-    private var dragHoldArmed = false
-    // Captured at the start of each touch gesture, so a gesture that began
-    // while armed still completes as a held-drag even if disarmed mid-way.
-    private var gestureIsDragHold = false
-    // Whether THIS gesture should behave as a held-drag - either because SEL
-    // was armed, or because you paused briefly before starting to drag (a
-    // deliberate "press, then drag" instead of an immediate swipe).
-    private var effectiveDragHold = false
 
     // Trackpad gesture bookkeeping (moving the visual cursor)
     private var startX = 0f
@@ -80,9 +76,17 @@ class MainActivity : AppCompatActivity() {
     private var isDragging = false
 
     // The touch we're holding "down" on the WebView, representing a
-    // potential click / long-press-right-click.
+    // potential click / long-press-right-click / grab-and-drag.
     private var syntheticTouchActive = false
     private var syntheticDownTime = 0L
+
+    // Double-tap-and-drag detection: remembers whether the PREVIOUS gesture
+    // was a plain, quick, non-dragging tap, and when it ended. If a new
+    // touch-down follows quickly enough, and THAT gesture turns into a drag
+    // without lifting first, it's treated as a grab-and-drag.
+    private var previousGestureWasQuickTap = false
+    private var previousGestureUpTime = 0L
+    private var gestureIsGrabDrag = false
 
     // Two-finger-drag => native touch scroll.
     private var scrollTouchActive = false
@@ -113,7 +117,12 @@ class MainActivity : AppCompatActivity() {
         private const val TAP_DISTANCE_THRESHOLD_PX = 18f
         private const val CURSOR_SENSITIVITY = 1.35f
         private const val FILE_CHOOSER_REQUEST_CODE = 51426
-        private const val HOLD_ENGAGE_MS = 180L
+
+        // A tap counts as "quick" (eligible to start a double-tap) if it's
+        // released within this long, with little to no movement.
+        private const val QUICK_TAP_MAX_MS = 280L
+        // How soon the second tap must begin after the first one ends.
+        private const val DOUBLE_TAP_WINDOW_MS = 350L
 
         private const val ZOOM_MIN = 30
         private const val ZOOM_MAX = 150
@@ -133,7 +142,6 @@ class MainActivity : AppCompatActivity() {
         touchPad = findViewById(R.id.touchPad)
         toolbar = findViewById(R.id.toolbar)
         toolbarButtons = findViewById(R.id.toolbarButtons)
-        dragSelectButton = findViewById(R.id.btnDragSelect)
 
         setupWebView()
         setupTrackpad()
@@ -260,13 +268,8 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "Zoom: $pageZoomPercent%", Toast.LENGTH_SHORT).show()
     }
 
-    private fun disarmDragHold() {
-        dragHoldArmed = false
-        dragSelectButton.setTextColor(0xFFFFFFFF.toInt())
-    }
-
     // ---------------------------------------------------------------------
-    // Virtual trackpad / mouse - dispatches REAL touch events to the WebView
+    // Virtual mouse - dispatches REAL touch events to the WebView
     // ---------------------------------------------------------------------
 
     private fun updateCursorView() {
@@ -277,9 +280,9 @@ class MainActivity : AppCompatActivity() {
         cursor.y = cursorY
     }
 
-    private fun sendSynthetic(action: Int, x: Float, y: Float, downTime: Long, metaState: Int = 0) {
+    private fun sendSynthetic(action: Int, x: Float, y: Float, downTime: Long) {
         val eventTime = SystemClock.uptimeMillis()
-        val ev = MotionEvent.obtain(downTime, eventTime, action, x, y, metaState)
+        val ev = MotionEvent.obtain(downTime, eventTime, action, x, y, 0)
         webView.dispatchTouchEvent(ev)
         ev.recycle()
     }
@@ -289,10 +292,11 @@ class MainActivity : AppCompatActivity() {
         touchPad.setOnTouchListener { _, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    // Lock in whether this whole gesture is a held-drag, so
-                    // toggling SEL mid-gesture can't change it partway through.
-                    gestureIsDragHold = dragHoldArmed
-                    effectiveDragHold = dragHoldArmed
+                    // Is this the second tap of a double-tap? If so, and it
+                    // turns into a drag below, we treat it as a grab-and-drag.
+                    val now = SystemClock.uptimeMillis()
+                    gestureIsGrabDrag = previousGestureWasQuickTap &&
+                        (now - previousGestureUpTime) <= DOUBLE_TAP_WINDOW_MS
 
                     startX = event.x
                     startY = event.y
@@ -314,6 +318,7 @@ class MainActivity : AppCompatActivity() {
                         sendSynthetic(MotionEvent.ACTION_CANCEL, cursorX, cursorY, syntheticDownTime)
                         syntheticTouchActive = false
                     }
+                    previousGestureWasQuickTap = false
                     if (event.pointerCount == 2) {
                         lastFocusX = (event.getX(0) + event.getX(1)) / 2f
                         lastFocusY = (event.getY(0) + event.getY(1)) / 2f
@@ -341,7 +346,7 @@ class MainActivity : AppCompatActivity() {
                     } else {
                         // Cursor ALWAYS moves relative to your finger, starting from
                         // wherever it currently is - identical behavior regardless
-                        // of SEL state. It never jumps to the touch point.
+                        // of what kind of gesture this turns out to be.
                         val dx = (event.x - lastX) * CURSOR_SENSITIVITY
                         val dy = (event.y - lastY) * CURSOR_SENSITIVITY
                         lastX = event.x
@@ -349,14 +354,6 @@ class MainActivity : AppCompatActivity() {
 
                         val totalDist = hypot((event.x - startX).toDouble(), (event.y - startY).toDouble())
                         if (totalDist > TAP_DISTANCE_THRESHOLD_PX) {
-                            if (!isDragging) {
-                                // A brief pause before the drag started (a deliberate
-                                // "press, then drag" rather than an immediate swipe)
-                                // automatically counts as a held-drag too - no need
-                                // to tap SEL first for the common case.
-                                val heldBeforeDragging = SystemClock.uptimeMillis() - syntheticDownTime >= HOLD_ENGAGE_MS
-                                if (heldBeforeDragging) effectiveDragHold = true
-                            }
                             isDragging = true
                         }
 
@@ -365,15 +362,16 @@ class MainActivity : AppCompatActivity() {
                         updateCursorView()
 
                         if (isDragging && syntheticTouchActive) {
-                            if (effectiveDragHold) {
-                                // Keep the touch "held down" and move it along with
-                                // the cursor - this is what lets you grab a small
-                                // selection-handle circle and drag it, exactly like
-                                // dragging a real touch-selection handle.
+                            if (gestureIsGrabDrag) {
+                                // Second tap of a double-tap, now dragging: keep the
+                                // touch "held down" and move it along with the cursor -
+                                // this is what lets you grab a small selection-handle
+                                // circle and drag it, exactly like dragging a real
+                                // touch-selection handle.
                                 sendSynthetic(MotionEvent.ACTION_MOVE, cursorX, cursorY, syntheticDownTime)
                             } else {
-                                // Normal trackpad mode: dragging only repositions
-                                // the cursor, it must not drag/select page content.
+                                // Ordinary drag: only repositions the cursor, must not
+                                // drag/select page content.
                                 sendSynthetic(MotionEvent.ACTION_CANCEL, cursorX, cursorY, syntheticDownTime)
                                 syntheticTouchActive = false
                             }
@@ -398,9 +396,13 @@ class MainActivity : AppCompatActivity() {
                         sendSynthetic(MotionEvent.ACTION_UP, cursorX, cursorY, syntheticDownTime)
                         syntheticTouchActive = false
                     }
-                    // A full gesture (tap or held-drag) just completed - if it was
-                    // armed, that job is done, so disarm automatically.
-                    if (gestureIsDragHold) disarmDragHold()
+
+                    // Remember whether this was a plain, quick, non-dragging tap,
+                    // so a fast-following second tap can be recognized as a
+                    // double-tap (and, if it drags, a grab-and-drag).
+                    val holdDuration = SystemClock.uptimeMillis() - syntheticDownTime
+                    previousGestureWasQuickTap = !isDragging && holdDuration < QUICK_TAP_MAX_MS
+                    previousGestureUpTime = SystemClock.uptimeMillis()
                 }
 
                 MotionEvent.ACTION_CANCEL -> {
@@ -412,6 +414,7 @@ class MainActivity : AppCompatActivity() {
                         sendSynthetic(MotionEvent.ACTION_CANCEL, scrollPointerX, scrollPointerY, scrollDownTime)
                         scrollTouchActive = false
                     }
+                    previousGestureWasQuickTap = false
                 }
             }
             true
@@ -445,21 +448,6 @@ class MainActivity : AppCompatActivity() {
         }
         findViewById<TextView>(R.id.btnZoomOut).setOnClickListener { changeZoom(-ZOOM_STEP) }
         findViewById<TextView>(R.id.btnZoomIn).setOnClickListener { changeZoom(ZOOM_STEP) }
-
-        dragSelectButton.setOnClickListener {
-            dragHoldArmed = !dragHoldArmed
-            dragSelectButton.setTextColor(
-                if (dragHoldArmed) 0xFF4CD964.toInt() else 0xFFFFFFFF.toInt()
-            )
-            Toast.makeText(
-                this,
-                if (dragHoldArmed)
-                    "Armed: aim the cursor tip on a handle, then press and drag it"
-                else
-                    "Grab-and-drag cancelled",
-                Toast.LENGTH_LONG
-            ).show()
-        }
 
         findViewById<TextView>(R.id.btnCollapseToggle).setOnClickListener { view ->
             val isCurrentlyVisible = toolbarButtons.visibility == View.VISIBLE
