@@ -127,17 +127,6 @@
                 android:textColor="#FFFFFF"
                 android:textSize="20sp"
                 android:contentDescription="Zoom in" />
-
-            <TextView
-                android:id="@+id/btnDragSelect"
-                android:layout_width="40dp"
-                android:layout_height="40dp"
-                android:gravity="center"
-                android:text="SEL"
-                android:textColor="#FFFFFF"
-                android:textStyle="bold"
-                android:textSize="11sp"
-                android:contentDescription="Toggle drag-select mode" />
         </LinearLayout>
     </LinearLayout>
 
