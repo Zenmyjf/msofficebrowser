@@ -282,7 +282,22 @@ class MainActivity : AppCompatActivity() {
 
     private fun sendSynthetic(action: Int, x: Float, y: Float, downTime: Long) {
         val eventTime = SystemClock.uptimeMillis()
-        val ev = MotionEvent.obtain(downTime, eventTime, action, x, y, 0)
+        // The default touch "size" Android reports for a bare obtain(...x,y,metaState)
+        // call is 1.0 - effectively the LARGEST possible contact area. Sites like
+        // Excel use this to judge how precise your touch is (e.g. deciding whether
+        // to show a small precise handle vs. a bigger, more forgiving one), so an
+        // oversized synthetic touch can get treated as clumsy/imprecise even when
+        // it's landing exactly on target. Explicitly reporting a small size here
+        // mimics a real fingertip's actual (much smaller) contact area.
+        val ev = MotionEvent.obtain(
+            downTime, eventTime, action, x, y,
+            1f,      // pressure
+            0.05f,   // size - small, precise contact
+            0,       // metaState
+            1f, 1f,  // xPrecision, yPrecision
+            0,       // deviceId
+            0        // edgeFlags
+        )
         webView.dispatchTouchEvent(ev)
         ev.recycle()
     }
