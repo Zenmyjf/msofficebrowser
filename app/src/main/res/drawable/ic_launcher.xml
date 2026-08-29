@@ -1,0 +1,49 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Background: rounded square with a blue-to-teal gradient -->
+    <path android:pathData="M0,24 Q0,0 24,0 L84,0 Q108,0 108,24 L108,84 Q108,108 84,108 L24,108 Q0,108 0,84 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="0"
+                android:startY="0"
+                android:endX="108"
+                android:endY="108"
+                android:startColor="#2563EB"
+                android:endColor="#0EA5E9" />
+        </aapt:attr>
+    </path>
+
+    <!-- Monitor body -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M24,28 h60 a6,6 0 0 1 6,6 v34 a6,6 0 0 1 -6,6 h-60 a6,6 0 0 1 -6,-6 v-34 a6,6 0 0 1 6,-6 Z" />
+
+    <!-- Screen -->
+    <path
+        android:fillColor="#1E3A8A"
+        android:pathData="M30,34 h48 v34 h-48 Z" />
+
+    <!-- Monitor neck -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M48,74 h12 v8 h-12 Z" />
+
+    <!-- Monitor base -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M39,82 h30 a4,4 0 0 1 4,4 v2 h-38 v-2 a4,4 0 0 1 4,-4 Z" />
+
+    <!-- Virtual cursor, overlapping the bottom-right of the screen -->
+    <path
+        android:fillColor="#0B1220"
+        android:pathData="M58,44 L58,72 L65.8,65.6 L70.2,76.8 L74.8,75 L70.4,63.9 L79,63.9 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M60.6,49 L60.6,66 L66,61.6 L70.3,72.4 L72.3,71.6 L68,60.8 L74.8,60.8 Z" />
+</vector>
